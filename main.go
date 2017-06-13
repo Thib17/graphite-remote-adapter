@@ -250,6 +250,8 @@ func serve(addr string, snappyFramed bool, writers []writer, readers []reader) e
 			return
 		}
 
+		fmt.Println(resp)
+
 		data, err := proto.Marshal(resp)
 		if err != nil {
 			log.With("response", resp).With("err", err).Warnln("Error marshaling remote read response")

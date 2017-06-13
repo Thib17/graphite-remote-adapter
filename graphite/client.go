@@ -21,7 +21,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"io/ioutil"
 	"time"
+	"encoding/json"
+	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -122,6 +125,57 @@ func (c *Client) Write(samples model.Samples) error {
 	return nil
 }
 
+type RenderResponse struct {
+	Target     string       `yaml:"target,omitempty" json:"target,omitempty"`
+	Datapoints []*Datapoint `yaml:"datapoints,omitempty" json:"datapoints,omitempty"`
+}
+
+type Datapoint struct {
+	Value       *float64
+	Timestamp   int64
+}
+
+func (d *Datapoint) UnmarshalJSON(b []byte) error {
+    var x []interface{}
+    err := json.Unmarshal(b, &x)
+    if err != nil {
+			return err
+    }
+		if x[0] != nil {
+			d.Value = x[0].(*float64)
+		}
+		d.Timestamp = int64(x[1].(float64))
+		return nil
+}
+
+func prepareUrl(host string, path string, params map[string]string) *url.URL {
+	values := url.Values{}
+	for k, v := range params {
+		values.Set(k, v)
+	}
+	return &url.URL{
+		Scheme: "http",
+		Host: host,
+		Path: path,
+		ForceQuery: true,
+		RawQuery: values.Encode(),
+	}
+}
+
+func fetchUrl(u *url.URL, ctx context.Context) ([]byte, error) {
+	hresp, err := ctxhttp.Get(ctx, http.DefaultClient, u.String())
+	if err != nil {
+		return nil, err
+	}
+	defer hresp.Body.Close()
+
+	body, err := ioutil.ReadAll(hresp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
 func (c *Client) Read(req *remote.ReadRequest) (*remote.ReadResponse, error) {
 	log.With("req", req).Debugf("Remote read")
 
@@ -129,25 +183,60 @@ func (c *Client) Read(req *remote.ReadRequest) (*remote.ReadResponse, error) {
 		return nil, nil
 	}
 
-	u, err := url.Parse(c.graphite_web)
-	if err != nil {
-		return nil, err
-	}
-
-	u.Path = expandEndpoint
-	// TODO: set the query params correctly:
-	// - format=treejson
-	// - leavesOnly=1
-	// - query=<prefix>.<__name__>.**
-
 	ctx, cancel := context.WithTimeout(context.Background(), c.read_timeout)
 	defer cancel()
 
-	hresp, err := ctxhttp.Get(ctx, http.DefaultClient, u.String())
-	if err != nil {
-		return nil, err
+	for _, query := range req.Queries {
+		from := query.StartTimestampMs/1000
+		until := query.EndTimestampMs/1000
+		expandUrl := prepareUrl(c.graphite_web,
+										expandEndpoint,
+										map[string]string{"format": "json",
+																			"leavesOnly": "1",
+																			"query": "local.**",
+																		},
+									)
+		// - query=<prefix>.<__name__>.**
+
+		body, err := fetchUrl(expandUrl, ctx)
+		expandResp := make(map[string]interface{})
+		err = json.Unmarshal(body, &expandResp)
+		if err != nil {
+			log.With("url", expandUrl).With("err", err).Warnln("Error parsing exand endpoint response body")
+			continue
+		}
+		if _, ok := expandResp["results"]; !ok {
+			log.With("url", expandUrl).Warnln("No 'results' key in exand endpoint response")
+			continue
+		}
+
+		for _, leaf := range expandResp["results"].([]interface{}) {
+			renderUrl := prepareUrl(c.graphite_web,
+											 renderEndpoint,
+											 map[string]string{"format": "json",
+																				"from": strconv.FormatInt(from, 10),
+																				"until": strconv.FormatInt(until, 10),
+																				"target": leaf.(string),
+											  								},
+										 )
+			body, err := fetchUrl(renderUrl, ctx)
+			renderResp := make([]RenderResponse, 0)
+			err = json.Unmarshal(body, &renderResp)
+			if err != nil {
+				log.With("url", renderUrl).With("err", err).Warnln("Error parsing render endpoint response body")
+				continue
+			}
+			if len(renderResp) == 0 {
+				log.With("url", renderUrl).Warnln("Empty render endpoint response")
+				continue
+			}
+			result := renderResp[0]
+			fmt.Println(result.Target)
+			for _, datapoint := range result.Datapoints {
+				fmt.Println(datapoint.Value, " -> ", datapoint.Timestamp)
+			}
+		}
 	}
-	defer hresp.Body.Close()
 
 	// TODO: Do post-filtering here and filter the right names, build TimeSeries.
 	// TODO: For each metric, get data (http request to /render?format=json)
